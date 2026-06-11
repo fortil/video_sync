@@ -1,0 +1,11 @@
+# Audio analysis (stronger beat detection)
+librosa>=0.10.2
+numpy>=1.26
+soundfile>=0.12
+
+# AI asset classifier (synced_edit.classifier)
+# The classifier itself only needs the Python stdlib + the system `ffmpeg`
+# binary for video frame extraction. `certifi` is recommended so HTTPS calls to
+# the OpenAI API verify correctly on macOS Python builds.
+# Requires the OPENAI_API_KEY environment variable at runtime.
+certifi>=2024.2.2
