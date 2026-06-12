@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .asset_selection import load_asset_tags, select_assets
 from .classifier import DEFAULT_TAGS, classify_folder
-from .audio_analysis import analyze_audio, trim_audio, write_analysis
+from .audio_analysis import analyze_audio, detect_emotion, trim_audio, write_analysis
 from .renderer import render_timeline
 from .report import write_report
 from .timecode import parse_timecode
@@ -51,6 +51,11 @@ def main() -> None:
         help="Do not run the AI classifier even if --project-folder has no assets.json.",
     )
     parser.add_argument(
+        "--no-auto-emotion",
+        action="store_true",
+        help="Do not auto-detect emotion from audio. Requires --mood to be set for smart selection.",
+    )
+    parser.add_argument(
         "--classify-model",
         default="gpt-4.1-mini",
         help="OpenAI vision model used by the auto-classifier.",
@@ -76,13 +81,34 @@ def main() -> None:
     analysis.source_audio_path = str(args.audio.expanduser().resolve())
     analysis.source_audio_start = audio_start
     analysis.source_audio_end = audio_end
+
+    # Auto-detect emotion unless suppressed or already set
+    if not args.no_auto_emotion and not analysis.detected_emotion:
+        analysis.detected_emotion, analysis.emotion_confidence = detect_emotion(analysis)
+        if analysis.emotion_confidence < 0.4:
+            print(
+                f"Auto-detected emotion: {analysis.detected_emotion} "
+                f"(confidence {analysis.emotion_confidence:.0%}, low — consider using --mood to override).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Auto-detected emotion: {analysis.detected_emotion} "
+                f"(confidence {analysis.emotion_confidence:.0%}).",
+                file=sys.stderr,
+            )
+
+    effective_mood = args.mood or (analysis.detected_emotion if not args.no_auto_emotion else None)
+    if effective_mood and not args.mood:
+        print(f"Using detected emotion '{effective_mood}' for asset selection.", file=sys.stderr)
+
     write_analysis(args.analysis, analysis)
 
     assets = collect_assets(args.assets)
     asset_metadata = load_asset_tags(args.project_folder)
     assets = select_assets(
         assets,
-        mood=args.mood,
+        mood=effective_mood,
         selection=args.selection,
         metadata=asset_metadata,
         project_folder=args.project_folder,
@@ -101,11 +127,16 @@ def main() -> None:
             "source_audio_path": analysis.source_audio_path,
             "source_audio_start": analysis.source_audio_start,
             "source_audio_end": analysis.source_audio_end,
+            "detected_emotion": analysis.detected_emotion,
+            "emotion_confidence": analysis.emotion_confidence,
+            "effective_mood": effective_mood,
         }
     )
     timeline.selection = {
         "mode": args.selection,
         "mood": args.mood,
+        "detected_emotion": analysis.detected_emotion,
+        "effective_mood": effective_mood,
         "metadata_file": str(args.project_folder.expanduser().resolve() / "assets.json") if args.project_folder else None,
     }
     write_timeline(args.timeline, timeline)

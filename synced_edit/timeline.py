@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .audio_analysis import AudioAnalysis
@@ -20,6 +20,7 @@ class TimelineItem:
     end: float
     duration: float
     effect: str
+    transition_hint: str = "cut"
 
 
 @dataclass
@@ -71,7 +72,13 @@ def build_timeline(
     if beats_per_cut < 1:
         raise ValueError("beats_per_cut must be >= 1")
 
-    cut_points = _cut_points(analysis.beats, analysis.duration, beats_per_cut)
+    if analysis.onset_strength:
+        cut_points = _adaptive_cut_points(
+            analysis.beats, analysis.onset_strength, analysis.duration, beats_per_cut
+        )
+    else:
+        cut_points = _cut_points(analysis.beats, analysis.duration, beats_per_cut)
+
     if max_items:
         cut_points = cut_points[: max_items + 1]
 
@@ -80,6 +87,7 @@ def build_timeline(
     for index, (start, end) in enumerate(zip(cut_points, cut_points[1:])):
         source = assets[index % len(assets)]
         source_type = "image" if source.suffix.lower() in IMAGE_EXTENSIONS else "video"
+        hint = _transition_hint_for(start, analysis.sections)
         items.append(
             TimelineItem(
                 index=index,
@@ -89,6 +97,7 @@ def build_timeline(
                 end=round(end, 4),
                 duration=round(end - start, 4),
                 effect=effects[index % len(effects)] if source_type == "image" else "fit",
+                transition_hint=hint,
             )
         )
 
@@ -116,6 +125,72 @@ def load_timeline(path: Path) -> Timeline:
         selection=data.get("selection", {}),
         items=[TimelineItem(**item) for item in data["items"]],
     )
+
+
+def _transition_hint_for(start_time: float, sections: list[dict]) -> str:
+    for section in sections:
+        if section.get("start", 0.0) <= start_time < section.get("end", float("inf")):
+            return "xfade" if section.get("energy_level") == "low" else "cut"
+    return "cut"
+
+
+def _adaptive_cut_points(
+    beats: list[float],
+    onset_strength: list[float],
+    duration: float,
+    beats_per_cut: int,
+) -> list[float]:
+    if not onset_strength or len(onset_strength) < len(beats):
+        return _cut_points(beats, duration, beats_per_cut)
+
+    max_onset = max(onset_strength) or 1.0
+    onset_norm = [v / max_onset for v in onset_strength]
+
+    sorted_norm = sorted(onset_norm)
+    n = len(sorted_norm)
+    threshold_high = sorted_norm[int(0.70 * n)]
+    threshold_low = sorted_norm[int(0.30 * n)]
+
+    points = [0.0]
+    last_cut_idx = 0
+    last_cut_time = 0.0
+    min_gap = 0.35
+
+    for i, beat_time in enumerate(beats):
+        if beat_time <= 0 or beat_time >= duration:
+            continue
+
+        beats_since = i - last_cut_idx
+        strength = onset_norm[i] if i < len(onset_norm) else 0.5
+
+        if strength >= threshold_high:
+            interval = 2
+        elif strength <= threshold_low:
+            interval = 6
+        else:
+            interval = beats_per_cut
+
+        is_downbeat = (i % 4 == 0)
+        should_cut_by_interval = beats_since >= interval
+        should_cut_by_downbeat = is_downbeat and beats_since >= 2
+
+        if (should_cut_by_interval or should_cut_by_downbeat) and beat_time - last_cut_time >= min_gap:
+            points.append(beat_time)
+            last_cut_idx = i
+            last_cut_time = beat_time
+
+    if not points or points[-1] < duration:
+        points.append(duration)
+
+    # Deduplication with 350ms floor
+    deduped = []
+    for point in points:
+        if not deduped or point - deduped[-1] >= min_gap:
+            deduped.append(point)
+    if deduped[-1] < duration:
+        deduped.append(duration)
+
+    return deduped
 
 
 def _cut_points(beats: list[float], duration: float, beats_per_cut: int) -> list[float]:

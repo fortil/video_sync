@@ -62,6 +62,14 @@ DEFAULT_TAGS = [
     "delicate",
     "high_energy",
     "motion",
+    "dramatic",
+    "euphoric",
+    "gentle",
+    "intense",
+    "melancholic",
+    "mysterious",
+    "nostalgic",
+    "urban",
 ]
 
 

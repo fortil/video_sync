@@ -7,11 +7,17 @@ from pathlib import Path
 from .timeline import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 
 
-MOOD_TAGS = {
-    "sad": {"calm", "cool", "flower", "plant", "closeup", "nature"},
-    "calm": {"calm", "warm", "nature", "wide_shot", "plant"},
-    "happy": {"bright", "warm", "motion", "wide_shot"},
-    "dramatic": {"motion", "high_energy", "cool", "wide_shot"},
+MOOD_TAGS: dict[str, set[str]] = {
+    "sad":        {"calm", "cool", "flower", "plant", "closeup", "nature", "melancholic", "gentle", "nostalgic"},
+    "calm":       {"calm", "warm", "nature", "wide_shot", "plant", "gentle"},
+    "happy":      {"bright", "warm", "motion", "wide_shot", "euphoric"},
+    "dramatic":   {"motion", "high_energy", "cool", "wide_shot", "dramatic", "intense"},
+    "intense":    {"high_energy", "motion", "intense", "dramatic", "bright", "wide_shot"},
+    "melancholic":{"calm", "cool", "dark", "closeup", "melancholic", "nostalgic", "gentle", "flower"},
+    "mysterious": {"dark", "cool", "closeup", "mysterious", "decay", "lonely"},
+    "euphoric":   {"bright", "warm", "motion", "wide_shot", "euphoric", "high_energy"},
+    "nostalgic":  {"warm", "closeup", "plant", "flower", "nostalgic", "melancholic"},
+    "gentle":     {"warm", "calm", "flower", "plant", "delicate", "gentle", "closeup"},
 }
 
 
@@ -60,6 +66,22 @@ def select_assets(
     return _interleave_types(profiles)
 
 
+def select_assets_for_emotion(
+    assets: list[Path],
+    emotion: str,
+    selection: str = "smart",
+    metadata: dict[str, set[str]] | None = None,
+    project_folder: Path | None = None,
+) -> list[Path]:
+    return select_assets(
+        assets,
+        mood=emotion,
+        selection=selection,
+        metadata=metadata,
+        project_folder=project_folder,
+    )
+
+
 def _profile_asset(
     asset: Path,
     metadata: dict[str, set[str]],
@@ -85,6 +107,23 @@ def _profile_asset(
         score -= 2.0
     if source_type == "video":
         score += 0.4
+
+    # Extended scoring for new emotion tags
+    if "melancholic" in tags and mood in {"sad", "melancholic"}:
+        score += 2.0
+    if "nostalgic" in tags and mood in {"sad", "melancholic", "nostalgic"}:
+        score += 1.5
+    if "intense" in tags and mood in {"intense", "dramatic"}:
+        score += 2.0
+    if "euphoric" in tags and mood in {"happy", "euphoric", "intense"}:
+        score += 1.5
+    if "gentle" in tags and mood in {"calm", "gentle", "melancholic"}:
+        score += 1.5
+    if "mysterious" in tags and mood == "mysterious":
+        score += 2.5
+    if "urban" in tags and mood in {"intense", "dramatic"}:
+        score += 0.8
+
     return AssetProfile(path=asset, tags=tags, source_type=source_type, score=score)
 
 

@@ -7,7 +7,7 @@ import struct
 import subprocess
 import tempfile
 import wave
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -21,6 +21,10 @@ class AudioAnalysis:
     source_audio_path: str | None = None
     source_audio_start: float | None = None
     source_audio_end: float | None = None
+    onset_strength: list[float] = field(default_factory=list)
+    sections: list[dict] = field(default_factory=list)
+    detected_emotion: str = ""
+    emotion_confidence: float = 0.0
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -45,6 +49,77 @@ def analyze_audio(audio_path: Path, manual_bpm: float | None = None) -> AudioAna
         return _analyze_with_librosa(audio_path)
     except Exception:
         return _analyze_with_energy(audio_path)
+
+
+def detect_emotion(analysis: AudioAnalysis) -> tuple[str, float]:
+    """Infer the dominant emotion of the song from audio analysis features.
+
+    Uses BPM, onset strength statistics, and section energy distribution.
+    Returns (emotion_name, confidence) where confidence is 0–1.
+    """
+    bpm = analysis.bpm
+    onset = analysis.onset_strength
+    sections = analysis.sections
+
+    if onset:
+        max_onset = max(onset) or 1.0
+        onset_norm = [v / max_onset for v in onset]
+        rms_mean_norm = sum(onset_norm) / len(onset_norm)
+        variance = sum((v - rms_mean_norm) ** 2 for v in onset_norm) / len(onset_norm)
+        rms_variance_norm = variance
+    else:
+        rms_mean_norm = 0.4
+        rms_variance_norm = 0.3
+
+    high_count = sum(1 for s in sections if s.get("energy_level") == "high")
+    total = len(sections) if sections else 1
+    high_ratio = high_count / total
+
+    emotion = "calm"
+    confidence = 0.0
+
+    if bpm >= 130 and rms_mean_norm > 0.6:
+        emotion = "intense"
+        c1 = min(1.0, (bpm - 130) / 30)
+        c2 = min(1.0, (rms_mean_norm - 0.6) / 0.4)
+        confidence = (c1 + c2) / 2
+
+    elif bpm >= 110 and high_ratio > 0.4:
+        emotion = "happy"
+        c1 = min(1.0, (bpm - 110) / 30)
+        c2 = min(1.0, (high_ratio - 0.4) / 0.6)
+        confidence = (c1 + c2) / 2
+
+    elif bpm >= 110:
+        emotion = "dramatic"
+        confidence = min(1.0, (bpm - 110) / 40)
+
+    elif bpm < 80 and rms_variance_norm < 0.2:
+        emotion = "calm"
+        c1 = min(1.0, (80 - bpm) / 20)
+        c2 = min(1.0, (0.2 - rms_variance_norm) / 0.2) if rms_variance_norm < 0.2 else 0.0
+        confidence = (c1 + c2) / 2
+
+    elif bpm < 80 and rms_mean_norm < 0.35:
+        emotion = "melancholic"
+        c1 = min(1.0, (80 - bpm) / 20)
+        c2 = min(1.0, (0.35 - rms_mean_norm) / 0.35)
+        confidence = (c1 + c2) / 2
+
+    elif bpm < 95 and rms_variance_norm > 0.5:
+        emotion = "sad"
+        c1 = min(1.0, (95 - bpm) / 25)
+        c2 = min(1.0, (rms_variance_norm - 0.5) / 0.5)
+        confidence = (c1 + c2) / 2
+
+    else:
+        emotion = "calm"
+        confidence = 0.3
+
+    if not onset:
+        confidence *= 0.4
+
+    return emotion, round(min(1.0, max(0.0, confidence)), 3)
 
 
 def write_analysis(path: Path, analysis: AudioAnalysis) -> None:
@@ -89,17 +164,34 @@ def _analyze_with_librosa(audio_path: Path) -> AudioAnalysis:
 
     y, sr = librosa.load(str(audio_path), mono=True)
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
-    beats = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
     duration = float(librosa.get_duration(y=y, sr=sr))
     bpm = float(tempo[0] if hasattr(tempo, "__len__") else tempo)
-    if len(beats) < 4:
+
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+
+    if len(beat_times) < 4:
         beats = _regular_beats(duration, bpm if bpm > 0 else 120)
+        onset_at_beats: list[float] = []
+    else:
+        filtered_pairs = [
+            (round(float(t), 4), float(onset_env[min(int(f), len(onset_env) - 1)]))
+            for t, f in zip(beat_times, beat_frames)
+            if 0 <= float(t) <= duration
+        ]
+        beats = [t for t, _ in filtered_pairs]
+        onset_at_beats = [o for _, o in filtered_pairs]
+
+    sections = _compute_sections(beats, onset_at_beats, duration)
+
     return AudioAnalysis(
         audio_path=str(audio_path),
         duration=duration,
         bpm=round(bpm, 2),
-        beats=[round(float(t), 4) for t in beats if 0 <= float(t) <= duration],
+        beats=beats,
         method="librosa",
+        onset_strength=onset_at_beats,
+        sections=sections,
     )
 
 
@@ -132,11 +224,15 @@ def _analyze_with_energy(audio_path: Path) -> AudioAnalysis:
     duration = len(samples) / sample_rate if sample_rate else probe_duration(audio_path)
     envelope = _rms_envelope(samples, sample_rate, frame_seconds=0.046)
     peaks = _pick_energy_peaks(envelope, hop_seconds=0.046, duration=duration)
+    onset_at_beats = _onset_strength_from_envelope(envelope, peaks, hop_seconds=0.046)
     bpm = _estimate_bpm(peaks)
 
     if not peaks or bpm <= 0:
         bpm = 120.0
         peaks = _regular_beats(duration, bpm)
+        onset_at_beats = []
+
+    sections = _compute_sections(peaks, onset_at_beats, duration)
 
     return AudioAnalysis(
         audio_path=str(audio_path),
@@ -144,6 +240,8 @@ def _analyze_with_energy(audio_path: Path) -> AudioAnalysis:
         bpm=round(bpm, 2),
         beats=[round(t, 4) for t in peaks if 0 <= t <= duration],
         method="ffmpeg-energy",
+        onset_strength=onset_at_beats,
+        sections=sections,
     )
 
 
@@ -198,6 +296,70 @@ def _pick_energy_peaks(envelope: list[float], hop_seconds: float, duration: floa
             last_time = time
 
     return peaks
+
+
+def _onset_strength_from_envelope(
+    envelope: list[float], peaks: list[float], hop_seconds: float
+) -> list[float]:
+    if len(envelope) < 2:
+        return []
+    onset = []
+    for t in peaks:
+        idx = min(int(t / hop_seconds), len(envelope) - 1)
+        prev_idx = max(0, idx - 1)
+        onset.append(max(0.0, envelope[idx] - envelope[prev_idx]))
+    return onset
+
+
+def _compute_sections(
+    beats: list[float], onset_strength: list[float], duration: float
+) -> list[dict]:
+    if len(onset_strength) < 2:
+        return [{"start": 0.0, "end": duration, "energy_level": "medium"}]
+
+    n_onset = len(onset_strength)
+    window = 8
+    windows: list[dict] = []
+
+    for i in range(0, min(len(beats), n_onset), window):
+        chunk = onset_strength[i : i + window]
+        if not chunk:
+            continue
+        mean_onset = sum(chunk) / len(chunk)
+        start = beats[i]
+        next_i = min(i + window, len(beats) - 1)
+        end = beats[next_i] if i + window < len(beats) else duration
+        windows.append({"start": start, "end": end, "mean": mean_onset})
+
+    if not windows:
+        return [{"start": 0.0, "end": duration, "energy_level": "medium"}]
+
+    sorted_means = sorted(w["mean"] for w in windows)
+    n = len(sorted_means)
+    threshold_low = sorted_means[max(0, n // 3 - 1)]
+    threshold_high = sorted_means[min(n - 1, (2 * n) // 3)]
+
+    raw: list[dict] = []
+    for w in windows:
+        if w["mean"] <= threshold_low:
+            level = "low"
+        elif w["mean"] >= threshold_high:
+            level = "high"
+        else:
+            level = "medium"
+        raw.append({"start": w["start"], "end": w["end"], "energy_level": level})
+
+    # Merge consecutive same-level sections
+    merged = [{"start": raw[0]["start"], "end": raw[0]["end"], "energy_level": raw[0]["energy_level"]}]
+    for section in raw[1:]:
+        if section["energy_level"] == merged[-1]["energy_level"]:
+            merged[-1]["end"] = section["end"]
+        else:
+            merged.append({"start": section["start"], "end": section["end"], "energy_level": section["energy_level"]})
+
+    merged[0]["start"] = 0.0
+    merged[-1]["end"] = duration
+    return merged
 
 
 def _estimate_bpm(peaks: list[float]) -> float:
