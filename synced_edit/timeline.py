@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -31,6 +32,7 @@ class Timeline:
     fps: int
     items: list[TimelineItem]
     selection: dict | None = None
+    focus: str = "dynamic"
 
     def to_json(self) -> dict:
         return {
@@ -38,6 +40,7 @@ class Timeline:
             "width": self.width,
             "height": self.height,
             "fps": self.fps,
+            "focus": self.focus,
             "selection": self.selection or {},
             "items": [asdict(item) for item in self.items],
         }
@@ -66,11 +69,20 @@ def build_timeline(
     fps: int = 30,
     beats_per_cut: int = 4,
     max_items: int | None = None,
+    max_clip_duration: float | None = None,
+    min_clip_duration: float | None = None,
+    focus: str = "dynamic",
 ) -> Timeline:
     if not assets:
         raise ValueError("No image or video assets found")
     if beats_per_cut < 1:
         raise ValueError("beats_per_cut must be >= 1")
+    if (
+        min_clip_duration
+        and max_clip_duration
+        and min_clip_duration > max_clip_duration
+    ):
+        raise ValueError("min_clip_duration cannot exceed max_clip_duration")
 
     if analysis.onset_strength:
         cut_points = _adaptive_cut_points(
@@ -79,11 +91,27 @@ def build_timeline(
     else:
         cut_points = _cut_points(analysis.beats, analysis.duration, beats_per_cut)
 
+    # Merge too-short clips first, then split too-long ones; with min <= max the two
+    # passes don't fight each other (max never splits a piece back below the min).
+    if min_clip_duration:
+        cut_points = _enforce_min_duration(cut_points, min_clip_duration)
+
+    if max_clip_duration:
+        cut_points = _enforce_max_duration(
+            cut_points, analysis.duration, max_clip_duration, min_clip_duration
+        )
+
     if max_items:
         cut_points = cut_points[: max_items + 1]
 
+    # "center"/"face" framing keeps the subject in frame, so drop the panning
+    # effects that drift the crop toward the edges (and into empty backgrounds).
+    if focus in ("center", "face"):
+        effects = ["zoom_in", "zoom_out"]
+    else:
+        effects = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
+
     items: list[TimelineItem] = []
-    effects = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
     for index, (start, end) in enumerate(zip(cut_points, cut_points[1:])):
         source = assets[index % len(assets)]
         source_type = "image" if source.suffix.lower() in IMAGE_EXTENSIONS else "video"
@@ -107,6 +135,7 @@ def build_timeline(
         height=height,
         fps=fps,
         items=items,
+        focus=focus,
     )
 
 
@@ -123,6 +152,7 @@ def load_timeline(path: Path) -> Timeline:
         height=int(data["height"]),
         fps=int(data["fps"]),
         selection=data.get("selection", {}),
+        focus=data.get("focus", "dynamic"),
         items=[TimelineItem(**item) for item in data["items"]],
     )
 
@@ -209,3 +239,68 @@ def _cut_points(beats: list[float], duration: float, beats_per_cut: int) -> list
     if deduped[-1] < duration:
         deduped.append(duration)
     return deduped
+
+
+def _enforce_min_duration(cut_points: list[float], min_duration: float) -> list[float]:
+    """Drop interior cut points so no clip is shorter than ``min_duration``.
+
+    Greedily keeps a cut only when it is at least ``min_duration`` past the last kept
+    cut, which merges short clips into their neighbour. The first point (0.0) and the
+    final endpoint (the song's end) are always preserved; a too-short final clip is
+    merged backward into the previous one.
+    """
+    if len(cut_points) <= 2:
+        return cut_points
+
+    result = [cut_points[0]]
+    for point in cut_points[1:-1]:
+        if point - result[-1] >= min_duration:
+            result.append(point)
+
+    last = cut_points[-1]
+    if last - result[-1] < min_duration and len(result) > 1:
+        result.pop()
+    result.append(last)
+    return result
+
+
+def _enforce_max_duration(
+    cut_points: list[float],
+    duration: float,
+    max_duration: float,
+    min_duration: float | None = None,
+) -> list[float]:
+    result = [cut_points[0]]
+    min_gap = 0.35
+
+    for i in range(len(cut_points) - 1):
+        current = cut_points[i]
+        next_point = cut_points[i + 1]
+        interval = next_point - current
+
+        if interval > max_duration:
+            num_splits = math.ceil(interval / max_duration)
+            if min_duration:
+                # Never split so finely that a piece would drop below the minimum;
+                # if min and max can't both hold, respect the minimum (fewer splits).
+                num_splits = min(num_splits, max(1, int(interval // min_duration)))
+            step = interval / num_splits
+            for j in range(1, num_splits):
+                split_point = current + step * j
+                if split_point - result[-1] >= min_gap:
+                    result.append(split_point)
+
+        if next_point - result[-1] >= min_gap:
+            result.append(next_point)
+
+    # Always land the final cut exactly on the song's end. Otherwise, if the last
+    # interval fell below min_gap it was dropped above, leaving result[-1] < duration:
+    # the rendered video would be shorter than the audio and "-shortest" would clip
+    # the song's ending mid-note.
+    if result[-1] < duration:
+        if duration - result[-1] < min_gap and len(result) > 1:
+            result[-1] = duration
+        else:
+            result.append(duration)
+
+    return result

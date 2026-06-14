@@ -37,7 +37,15 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=1080)
     parser.add_argument("--height", type=int, default=1920)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--crf", type=int, default=18, help="Final video quality (libx264 CRF). Lower = higher quality/larger file. 18=high, 23=default, 15=near-lossless.")
+    parser.add_argument("--preset", default="medium", help="libx264 speed/quality preset for the final encode (e.g. veryfast, medium, slow). Slower = better compression.")
     parser.add_argument("--beats-per-cut", type=int, default=4)
+    parser.add_argument("--max-clip-duration", type=float, default=None, help="Maximum duration (seconds) for any single clip. Longer intervals are auto-split.")
+    parser.add_argument("--min-clip-duration", type=float, default=None, help="Minimum duration (seconds) for any single clip. Shorter clips are merged with neighbours.")
+    parser.add_argument("--focus", choices=["dynamic", "center", "face"], default="dynamic", help="Image framing: 'dynamic' pans/zooms; 'center' keeps the subject centered (no edge drift); 'face' centers on a detected face (needs opencv-python, falls back to center).")
+    parser.add_argument("--mix-video-audio", action="store_true", help="Keep each video clip's own audio and play it over a quiet background song. Without this flag, only the song plays.")
+    parser.add_argument("--video-audio-volume", type=float, default=1.0, help="Volume of the video clips' own audio when --mix-video-audio is set (default 1.0).")
+    parser.add_argument("--background-audio-volume", type=float, default=0.15, help="Volume of the background song when mixed under video audio (default 0.15).")
     parser.add_argument("--selection", choices=["order", "smart"], default="order")
     parser.add_argument("--mood", default=None, help="Creative mood hint for smart selection, e.g. sad, calm, happy.")
     parser.add_argument("--manual-bpm", type=float, default=None)
@@ -121,6 +129,9 @@ def main() -> None:
         fps=args.fps,
         beats_per_cut=args.beats_per_cut,
         max_items=args.max_items,
+        max_clip_duration=args.max_clip_duration,
+        min_clip_duration=args.min_clip_duration,
+        focus=args.focus,
     )
     timeline.audio.update(
         {
@@ -142,7 +153,16 @@ def main() -> None:
     write_timeline(args.timeline, timeline)
 
     if not args.skip_render:
-        render_timeline(timeline, args.output, work_dir=Path("work"))
+        render_timeline(
+            timeline,
+            args.output,
+            work_dir=Path("work"),
+            mix_video_audio=args.mix_video_audio,
+            video_audio_volume=args.video_audio_volume,
+            background_audio_volume=args.background_audio_volume,
+            crf=args.crf,
+            preset=args.preset,
+        )
 
     report_path = args.report or Path("outputs") / f"reporte_{date.today().isoformat()}_synced_edit.md"
     write_report(report_path, timeline, args.output)
@@ -154,16 +174,19 @@ def main() -> None:
 
 
 def _ensure_assets_metadata(args: argparse.Namespace) -> None:
-    """Auto-generate assets.json via the AI classifier when it is missing.
+    """Auto-generate (or top up) assets.json via the AI classifier.
 
-    Unified flow for project folders:
-      * If <project>/assets.json exists -> use it directly (no API calls).
-      * If it does not exist -> classify the project folder with OPENAI_API_KEY,
-        write assets.json, then continue with the render.
+    Unified, incremental flow for project folders:
+      * If <project>/assets.json is missing -> classify everything and write it.
+      * If it exists -> classify only the assets that are not already in it and
+        merge them in. Assets already tagged are reused with no API calls, so you
+        never re-classify (or re-pay for) media that was tagged on a previous run.
+        When every asset is already present, no API key is needed at all.
 
     Only runs when --project-folder is set. Disabled by --no-auto-classify. If the
-    classifier cannot run (e.g. no API key or no media), the pipeline continues
-    without tags and falls back to plain ordering instead of failing the render.
+    classifier cannot run (e.g. no API key for the new assets, or no media), the
+    pipeline continues with whatever tags exist and falls back to plain ordering
+    instead of failing the render.
     """
     if args.project_folder is None or args.no_auto_classify:
         return
@@ -171,13 +194,15 @@ def _ensure_assets_metadata(args: argparse.Namespace) -> None:
     project = args.project_folder.expanduser().resolve()
     metadata_path = project / "assets.json"
     if metadata_path.exists():
-        print(f"Using existing assets.json: {metadata_path}", file=sys.stderr)
-        return
-
-    print(
-        f"No assets.json found in {project}; running the AI classifier...",
-        file=sys.stderr,
-    )
+        print(
+            f"Found {metadata_path}; classifying any assets not yet in it...",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"No assets.json found in {project}; running the AI classifier...",
+            file=sys.stderr,
+        )
     try:
         classify_folder(
             project,
@@ -189,7 +214,7 @@ def _ensure_assets_metadata(args: argparse.Namespace) -> None:
     except RuntimeError as exc:
         print(
             f"Auto-classification skipped: {exc}\n"
-            "Continuing without tags (selection falls back to plain ordering).",
+            "Continuing with existing tags (selection falls back to plain ordering).",
             file=sys.stderr,
         )
 

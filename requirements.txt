@@ -9,3 +9,8 @@ soundfile>=0.12
 # the OpenAI API verify correctly on macOS Python builds.
 # Requires the OPENAI_API_KEY environment variable at runtime.
 certifi>=2024.2.2
+
+# Optional: face-aware framing for the renderer (--focus face). Without it,
+# --focus face falls back to centered framing. Install on demand:
+#   pip install opencv-python-headless
+# opencv-python-headless>=4.9

@@ -121,6 +121,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of representative frames to extract from each video.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-classify every asset from scratch, ignoring any existing assets.json "
+        "(default is incremental: only tag assets not already present).",
+    )
+    parser.add_argument(
         "--ffmpeg",
         default="ffmpeg",
         help="Path to ffmpeg. Defaults to resolving 'ffmpeg' from PATH.",
@@ -312,6 +318,28 @@ def classify_media(
     return normalize_tags(parsed.get("tags"), set(allowed_tags), max_tags)
 
 
+def load_existing_metadata(output_path: Path) -> dict[str, list[str]]:
+    """Load an existing assets.json, tolerating a missing or corrupt file.
+
+    Returns an empty mapping when the file does not exist or cannot be parsed,
+    so a damaged metadata file never blocks (re)classification.
+    """
+    if not output_path.exists():
+        return {}
+    try:
+        data = json.loads(output_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Keep only well-formed "path -> list[str]" entries.
+    clean: dict[str, list[str]] = {}
+    for key, value in data.items():
+        if isinstance(key, str) and isinstance(value, list):
+            clean[key] = [t for t in value if isinstance(t, str)]
+    return clean
+
+
 def classify_folder(
     root_dir: Path | str,
     output: Path | str | None = None,
@@ -323,11 +351,22 @@ def classify_folder(
     video_frames: int = 4,
     ffmpeg_binary: str = "ffmpeg",
     api_key: str | None = None,
+    incremental: bool = True,
 ) -> Path:
-    """Classify every asset under ``root_dir`` and write an ``assets.json`` file.
+    """Classify assets under ``root_dir`` and write an ``assets.json`` file.
 
-    Returns the path to the written metadata file. Raises ``RuntimeError`` if the
-    folder is invalid, no API key is available, or no supported media is found.
+    By default this is **incremental**: an existing ``assets.json`` is loaded and
+    only assets that are not already keys in it are sent to the model; their tags
+    are merged in and the file is rewritten. This avoids re-classifying (and
+    re-paying for) media that was already tagged on a previous run. Pass
+    ``incremental=False`` to ignore any existing file and re-tag everything.
+
+    Results are written after every newly-classified asset, so a crash or Ctrl-C
+    mid-run keeps prior progress and a re-run resumes where it stopped.
+
+    Returns the path to the metadata file. Raises ``RuntimeError`` if the folder is
+    invalid, no supported media is found, or — only when there is new work to do —
+    no API key is available.
     """
     root_dir = Path(root_dir).expanduser().resolve()
     output_path = (
@@ -339,25 +378,48 @@ def classify_folder(
     if not root_dir.is_dir():
         raise RuntimeError(f"Root folder does not exist: {root_dir}")
 
-    api_key = api_key or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Missing OPENAI_API_KEY. Export it before running the classifier."
-        )
-
     media_files = list_assets(root_dir)
     if not media_files:
         raise RuntimeError(
             f"No supported assets found under {root_dir}/images or {root_dir}/videos."
         )
 
-    metadata: dict[str, list[str]] = {}
+    metadata = load_existing_metadata(output_path) if incremental else {}
+
+    pending = [
+        media_path
+        for media_path in media_files
+        if media_path.relative_to(root_dir).as_posix() not in metadata
+    ]
+
+    if not pending:
+        print(
+            f"All {len(media_files)} assets already classified in {output_path}; "
+            "nothing new to tag.",
+            file=sys.stderr,
+        )
+        return output_path
+
+    # Only require an API key once we know there is actually new work to do, so a
+    # fully-classified folder can be reused with no key and no network calls.
+    api_key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing OPENAI_API_KEY. Export it before running the classifier."
+        )
+
+    already = len(metadata)
+    if already:
+        print(
+            f"Found {already} existing tags; classifying {len(pending)} new asset(s).",
+            file=sys.stderr,
+        )
 
     with tempfile.TemporaryDirectory(prefix="media_frames_") as temp_name:
         temp_dir = Path(temp_name)
-        for index, media_path in enumerate(media_files, start=1):
+        for index, media_path in enumerate(pending, start=1):
             asset_key = media_path.relative_to(root_dir).as_posix()
-            print(f"[{index}/{len(media_files)}] Classifying {asset_key}...", file=sys.stderr)
+            print(f"[{index}/{len(pending)}] Classifying {asset_key}...", file=sys.stderr)
             image_paths = [media_path]
             if is_video(media_path):
                 image_paths = extract_video_frames(
@@ -369,6 +431,7 @@ def classify_folder(
                 if not image_paths:
                     print(f"Skipping {asset_key}: no video frames extracted.", file=sys.stderr)
                     metadata[asset_key] = []
+                    _write_metadata(output_path, metadata)
                     continue
 
             metadata[asset_key] = classify_media(
@@ -379,14 +442,22 @@ def classify_folder(
                 allowed_tags=tags,
                 max_tags=max_tags,
             )
+            # Persist after each asset so progress survives a crash / interruption.
+            _write_metadata(output_path, metadata)
             time.sleep(sleep)
 
+    print(
+        f"Wrote {len(metadata)} entries to {output_path} ({len(pending)} new).",
+    )
+    return output_path
+
+
+def _write_metadata(output_path: Path, metadata: dict[str, list[str]]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(dict(sorted(metadata.items())), indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    print(f"Wrote {len(metadata)} entries to {output_path}")
-    return output_path
 
 
 def main() -> int:
@@ -406,6 +477,7 @@ def main() -> int:
             sleep=args.sleep,
             video_frames=args.video_frames,
             ffmpeg_binary=args.ffmpeg,
+            incremental=not args.force,
         )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
