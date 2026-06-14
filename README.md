@@ -243,15 +243,15 @@ Every option of the renderer CLI, what it does, and its default.
 | `--fps N` | `30` | Output frame rate. |
 | `--crf N` | `18` | Final video quality (libx264 CRF). **Lower = higher quality / larger file.** 18 = high, 23 = old default, 15 ≈ near-lossless. Per-clip intermediates are always encoded near-losslessly so only this final pass sets the delivered quality. |
 | `--preset NAME` | `medium` | libx264 speed/quality preset for the final encode (`veryfast`, `medium`, `slow`, …). Slower = better compression at the same CRF. |
-| `--focus {dynamic,center,face}` | `dynamic` | Image framing. `dynamic` = the original zoom + pan effects. `center` = centered zoom only, with no panning toward the edges (keeps a centered subject in frame). `face` = center the crop on the largest detected face, falling back to `center` when no face is found. **`face` needs OpenCV** — `pip install opencv-python-headless` (or `opencv-python`); without it, `face` behaves like `center`. Applies to images; video clips are always fitted. |
+| `--focus {dynamic,center,face}` | `face` | Image framing. `dynamic` = the original zoom + pan effects. `center` = centered zoom only, with no panning toward the edges (keeps a centered subject in frame). `face` = center the crop on the largest detected face, falling back to `center` when no face is found. **`face` needs OpenCV** — `pip install opencv-python-headless` (or `opencv-python`); without it, `face` behaves like `center`. Applies to images; video clips are always fitted. |
 
 ### Cutting & timing
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `--beats-per-cut N` | `4` | How many beats each clip spans. Lower = faster cuts (e.g. `2` for quicker changes). |
-| `--max-clip-duration SECONDS` | – | Hard cap on any single clip. Longer stretches (e.g. quiet, beat-less intros that would otherwise freeze an image) are auto-split into animated cuts ≤ this length. |
-| `--min-clip-duration SECONDS` | – | Floor on any single clip. Clips shorter than this (e.g. very short video sources or rapid beats) are merged with their neighbour so nothing flashes by. Must be ≤ `--max-clip-duration`. |
+| `--beats-per-cut N` | `2` | How many beats each clip spans. Lower = faster cuts. |
+| `--max-image-duration SECONDS` | `4` | Cap on how long any one **image** is shown before switching to a **different** photo. A long, beat-less stretch is filled with a sequence of different images (each ≤ this length) instead of freezing on one. `0` disables. **Images only — videos are never split.** |
+| `--min-video-duration SECONDS` | `4` | Floor on how long a single **video** plays. A shorter clip grows by eating just enough of the following beats (looping to fill) so it doesn't flash by; any leftover becomes its own clip. `0` disables. **Videos only — images are never affected.** |
 | `--manual-bpm N` | – | Override automatic beat detection with a fixed BPM. |
 | `--audio-start TIME` | `0` | Start of the audio segment to use. Seconds, `MM:SS`, or `HH:MM:SS`. |
 | `--audio-end TIME` | – | End of the audio segment to use (same formats). |
@@ -261,7 +261,7 @@ Every option of the renderer CLI, what it does, and its default.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `--mix-video-audio` | off | Keep each video clip's **own** audio and play it over a quiet background song. Without this flag, only the song plays. Images contribute silence. |
+| `--mix-video-audio` / `--no-mix-video-audio` | on | Keep each video clip's **own** audio and play it over a quiet background song (on by default). `--no-mix-video-audio` plays only the song. Images contribute silence. |
 | `--video-audio-volume N` | `1.0` | Volume of the video clips' own audio when `--mix-video-audio` is set. |
 | `--background-audio-volume N` | `0.15` | Volume of the background song when it sits under video audio. (Ignored without `--mix-video-audio`; the song then plays at full volume.) |
 
@@ -269,8 +269,10 @@ Every option of the renderer CLI, what it does, and its default.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `--selection {order,smart}` | `order` | `order` = file order; `smart` = order assets by tags/mood using `assets.json`. |
-| `--mood NAME` | – | Creative mood hint for smart selection (e.g. `sad`, `calm`, `happy`, `bittersweet`). Overrides auto-detected emotion. |
+| `--selection {order,smart}` | `smart` | `order` = file order; `smart` = order assets by tags/mood using `assets.json`. |
+| `--mood NAME` | `bittersweet` | Creative mood hint for smart selection (e.g. `sad`, `calm`, `happy`, `bittersweet`). Overrides auto-detected emotion; pass an empty string (`--mood ""`) to use the auto-detected emotion instead. |
+| `--max-asset-uses N` | `3` | Max times any one **image** may appear. **Videos are exempt** — a reused video seeks to a different fragment each time, so it can repeat without showing the same moment twice. The same asset never appears twice in a row. When too few images exist to fill the song under the cap (and no videos take the slack), the grid is first coarsened into fewer, longer clips; if that still isn't enough, images repeat more than the cap rather than freeze — a warning is printed either way. Set `0` to disable the image cap. |
+| `--seed N` | `0` | Seed for the per-pass asset shuffle. Each repeat pass over the media is reshuffled (the first keeps the smart/mood order), so a folder with few assets does not play the same sequence on loop. Same seed → identical output; change it to get a different arrangement of the same media. |
 | `--no-auto-emotion` | off | Do not auto-detect emotion from the audio. With this set, smart selection needs `--mood`. |
 
 ### Auto-classification (tagging)

@@ -39,15 +39,17 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--crf", type=int, default=18, help="Final video quality (libx264 CRF). Lower = higher quality/larger file. 18=high, 23=default, 15=near-lossless.")
     parser.add_argument("--preset", default="medium", help="libx264 speed/quality preset for the final encode (e.g. veryfast, medium, slow). Slower = better compression.")
-    parser.add_argument("--beats-per-cut", type=int, default=4)
-    parser.add_argument("--max-clip-duration", type=float, default=None, help="Maximum duration (seconds) for any single clip. Longer intervals are auto-split.")
-    parser.add_argument("--min-clip-duration", type=float, default=None, help="Minimum duration (seconds) for any single clip. Shorter clips are merged with neighbours.")
-    parser.add_argument("--focus", choices=["dynamic", "center", "face"], default="dynamic", help="Image framing: 'dynamic' pans/zooms; 'center' keeps the subject centered (no edge drift); 'face' centers on a detected face (needs opencv-python, falls back to center).")
-    parser.add_argument("--mix-video-audio", action="store_true", help="Keep each video clip's own audio and play it over a quiet background song. Without this flag, only the song plays.")
+    parser.add_argument("--beats-per-cut", type=int, default=2)
+    parser.add_argument("--max-image-duration", type=float, default=4.0, help="Maximum seconds a single IMAGE is shown before switching to a different photo (default 4). 0 disables. Does not affect videos.")
+    parser.add_argument("--min-video-duration", type=float, default=4.0, help="Minimum seconds a single VIDEO plays; shorter clips absorb following beats (looping) so they don't flash by (default 4). 0 disables. Does not affect images.")
+    parser.add_argument("--max-asset-uses", type=int, default=3, help="Max times any one image may appear (default 3). Videos are exempt (they seek a different fragment each time). Set 0 to disable.")
+    parser.add_argument("--seed", type=int, default=0, help="Shuffle seed for asset ordering on repeat passes (default 0). Change it to get a different arrangement of the same media.")
+    parser.add_argument("--focus", choices=["dynamic", "center", "face"], default="face", help="Image framing (default face): 'dynamic' pans/zooms; 'center' keeps the subject centered (no edge drift); 'face' centers on a detected face (needs opencv-python, falls back to center).")
+    parser.add_argument("--mix-video-audio", action=argparse.BooleanOptionalAction, default=True, help="Keep each video clip's own audio and play it over a quiet background song (default on). Use --no-mix-video-audio to play only the song.")
     parser.add_argument("--video-audio-volume", type=float, default=1.0, help="Volume of the video clips' own audio when --mix-video-audio is set (default 1.0).")
     parser.add_argument("--background-audio-volume", type=float, default=0.15, help="Volume of the background song when mixed under video audio (default 0.15).")
-    parser.add_argument("--selection", choices=["order", "smart"], default="order")
-    parser.add_argument("--mood", default=None, help="Creative mood hint for smart selection, e.g. sad, calm, happy.")
+    parser.add_argument("--selection", choices=["order", "smart"], default="smart")
+    parser.add_argument("--mood", default="bittersweet", help="Creative mood hint for smart selection, e.g. sad, calm, happy (default bittersweet). Pass an empty string to fall back to auto-detected emotion.")
     parser.add_argument("--manual-bpm", type=float, default=None)
     parser.add_argument("--audio-start", default="0", help="Start time in seconds, MM:SS, or HH:MM:SS.")
     parser.add_argument("--audio-end", default=None, help="End time in seconds, MM:SS, or HH:MM:SS.")
@@ -129,9 +131,11 @@ def main() -> None:
         fps=args.fps,
         beats_per_cut=args.beats_per_cut,
         max_items=args.max_items,
-        max_clip_duration=args.max_clip_duration,
-        min_clip_duration=args.min_clip_duration,
+        max_image_duration=args.max_image_duration,
+        min_video_duration=args.min_video_duration,
+        max_asset_uses=args.max_asset_uses,
         focus=args.focus,
+        seed=args.seed,
     )
     timeline.audio.update(
         {

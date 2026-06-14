@@ -445,29 +445,49 @@ def _render_video_clip(source: Path, item: TimelineItem, timeline: Timeline, out
         f"scale={timeline.width}:{timeline.height}:force_original_aspect_ratio=increase,"
         f"crop={timeline.width}:{timeline.height},fps={timeline.fps},format=yuv420p"
     )
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-stream_loop",
-            "-1",
-            "-i",
-            str(source),
-            "-t",
-            f"{item.duration:.4f}",
-            "-vf",
-            vf,
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            _INTERMEDIATE_PRESET,
-            "-crf",
-            str(_INTERMEDIATE_CRF),
-            str(output_path),
-        ],
-        check=True,
-    )
+    # When a video is reused, each appearance seeks to a different fragment so it
+    # never shows the same moment twice. Input seeking (-ss before -i) combined with
+    # -stream_loop -1 plays `duration` seconds from the offset, looping if it reaches
+    # the source end.
+    offset = _fragment_offset(source, item)
+    cmd = ["ffmpeg", "-y"]
+    if offset > 0:
+        cmd += ["-ss", f"{offset:.4f}"]
+    cmd += [
+        "-stream_loop", "-1",
+        "-i", str(source),
+        "-t", f"{item.duration:.4f}",
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", _INTERMEDIATE_PRESET,
+        "-crf", str(_INTERMEDIATE_CRF),
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _fragment_offset(source: Path, item: TimelineItem) -> float:
+    """Start offset (seconds) into the source for this video appearance.
+
+    The source holds at most ``capacity = floor(source_duration / clip)`` non-
+    overlapping fragments of this clip length. Spread those evenly and map the
+    appearance index to ``fragment % capacity`` so the first ``capacity``
+    appearances seek to distinct, evenly-spaced moments (instead of the arbitrary
+    modular collisions a raw ``fragment * clip % source`` produces). Beyond that the
+    source simply has no more distinct footage, so fragments reuse evenly.
+
+    Returns 0 for the first appearance or when the source is no longer than the clip
+    (it just loops).
+    """
+    fragment = getattr(item, "fragment", 0)
+    if not fragment:
+        return 0.0
+    source_duration = _probe_duration(source)
+    if source_duration <= item.duration:
+        return 0.0
+    capacity = max(1, int(source_duration / item.duration))
+    return round((fragment % capacity) * (source_duration / capacity), 4)
 
 
 def _crop_filter(source: Path, timeline: Timeline) -> str:

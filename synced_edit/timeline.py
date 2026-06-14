@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import random
+import sys
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -22,6 +25,10 @@ class TimelineItem:
     duration: float
     effect: str
     transition_hint: str = "cut"
+    # For videos reused more than once: which appearance this is (0, 1, 2, ...).
+    # The renderer seeks to a different fragment of the source per appearance so a
+    # repeated video never shows the same moment twice. Always 0 for images.
+    fragment: int = 0
 
 
 @dataclass
@@ -69,20 +76,16 @@ def build_timeline(
     fps: int = 30,
     beats_per_cut: int = 4,
     max_items: int | None = None,
-    max_clip_duration: float | None = None,
-    min_clip_duration: float | None = None,
+    max_image_duration: float | None = None,
+    min_video_duration: float | None = None,
+    max_asset_uses: int | None = 3,
     focus: str = "dynamic",
+    seed: int = 0,
 ) -> Timeline:
     if not assets:
         raise ValueError("No image or video assets found")
     if beats_per_cut < 1:
         raise ValueError("beats_per_cut must be >= 1")
-    if (
-        min_clip_duration
-        and max_clip_duration
-        and min_clip_duration > max_clip_duration
-    ):
-        raise ValueError("min_clip_duration cannot exceed max_clip_duration")
 
     if analysis.onset_strength:
         cut_points = _adaptive_cut_points(
@@ -91,18 +94,31 @@ def build_timeline(
     else:
         cut_points = _cut_points(analysis.beats, analysis.duration, beats_per_cut)
 
-    # Merge too-short clips first, then split too-long ones; with min <= max the two
-    # passes don't fight each other (max never splits a piece back below the min).
-    if min_clip_duration:
-        cut_points = _enforce_min_duration(cut_points, min_clip_duration)
+    song_end = cut_points[-1]
+    segments = list(zip(cut_points, cut_points[1:]))
 
-    if max_clip_duration:
-        cut_points = _enforce_max_duration(
-            cut_points, analysis.duration, max_clip_duration, min_clip_duration
+    def _is_image(path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_EXTENSIONS
+
+    images = [a for a in assets if _is_image(a)]
+    videos = [a for a in assets if not _is_image(a)]
+    cap = max_asset_uses if max_asset_uses and max_asset_uses > 0 else None
+
+    # Coarsen the grid ONLY when images alone can't cover the cuts under the cap and
+    # there are no videos to absorb the overflow. Videos may repeat freely (each
+    # appearance shows a different fragment), so when any video exists the grid never
+    # needs coarsening — extra slots simply go to videos.
+    if cap and not videos and len(segments) > cap * len(images):
+        capacity = cap * len(images)
+        print(
+            f"Only {len(images)} image(s) for {len(segments)} cuts: coarsening to "
+            f"{capacity} clips so none repeats more than {cap}x "
+            "(add more media or shorten the audio range for more variety).",
+            file=sys.stderr,
         )
+        segments = _downsample_segments(segments, capacity)
 
-    if max_items:
-        cut_points = cut_points[: max_items + 1]
+    work: deque[tuple[float, float]] = deque(segments)
 
     # "center"/"face" framing keeps the subject in frame, so drop the panning
     # effects that drift the crop toward the edges (and into empty backgrounds).
@@ -111,23 +127,131 @@ def build_timeline(
     else:
         effects = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
 
+    # Assignment rules:
+    #   * Images are capped at `cap` appearances and may never repeat back-to-back.
+    #   * Videos are NOT capped: a repeat just gets the next fragment index so the
+    #     renderer seeks to a different moment of the source. They also avoid
+    #     immediate repeats when an alternative exists.
+    #   * max_image_duration: a long IMAGE slot is filled with a SEQUENCE of
+    #     different photos (each <= the max), never the same one twice in a row.
+    #   * min_video_duration: a short VIDEO grows by eating following beats.
+    min_gap = 0.35
+    img_use: dict[str, int] = {}
+    vid_frag: dict[str, int] = {}
     items: list[TimelineItem] = []
-    for index, (start, end) in enumerate(zip(cut_points, cut_points[1:])):
-        source = assets[index % len(assets)]
-        source_type = "image" if source.suffix.lower() in IMAGE_EXTENSIONS else "video"
-        hint = _transition_hint_for(start, analysis.sections)
-        items.append(
-            TimelineItem(
-                index=index,
-                source=str(source),
-                source_type=source_type,
-                start=round(start, 4),
-                end=round(end, 4),
-                duration=round(end - start, 4),
-                effect=effects[index % len(effects)] if source_type == "image" else "fit",
-                transition_hint=hint,
+    effect_index = 0
+    last_source: str | None = None
+    cap_exceeded = False
+
+    # Draw assets a shuffled "round" at a time rather than in fixed round-robin
+    # order. Each round is one appearance of every still-eligible asset; reshuffling
+    # per round means consecutive cycles are NOT identical, so a folder with few
+    # assets no longer plays the same 2-minute sequence on repeat. The first round
+    # keeps the given (smart/mood) order so the opening still follows the ranking.
+    rng = random.Random(seed)
+    round_bag: list[Path] = []
+    rounds_done = 0
+
+    def _pick() -> Path:
+        """Next asset: one per shuffled round, never an immediate repeat.
+
+        A round contains every image still under the cap plus every video. When all
+        images are capped and there is no video to fill the slot, the cap is relaxed
+        (images repeat, shuffled) rather than freezing one photo.
+        """
+        nonlocal round_bag, rounds_done, cap_exceeded
+        if not round_bag:
+            eligible = [
+                a for a in assets
+                if not (_is_image(a) and cap and img_use.get(str(a), 0) >= cap)
+            ]
+            if not eligible:
+                eligible = list(assets)
+                cap_exceeded = True
+            if rounds_done > 0:
+                rng.shuffle(eligible)
+            round_bag = eligible
+            rounds_done += 1
+        for i in range(len(round_bag)):
+            if str(round_bag[i]) != last_source:
+                return round_bag.pop(i)
+        # Only the previous source is left this round (e.g. all images are capped and
+        # the lone video would otherwise chain into a tail). Relax the cap and take a
+        # different asset so nothing repeats back-to-back; repeat only when there is
+        # genuinely a single asset.
+        others = [a for a in assets if str(a) != last_source]
+        if not others:
+            return round_bag.pop(0)
+        rng.shuffle(others)
+        choice = others[0]
+        if _is_image(choice) and cap and img_use.get(str(choice), 0) >= cap:
+            cap_exceeded = True
+        return choice
+
+    while work:
+        start, end = work.popleft()
+        source = _pick()
+        skey = str(source)
+
+        if not _is_image(source):
+            # Video: grow to the minimum if too short, then place with its fragment.
+            if min_video_duration and (end - start) < min_video_duration:
+                target = min(start + min_video_duration, song_end)
+                while end < target - 1e-9 and work:
+                    end = work.popleft()[1]
+                if end - target >= min_gap:
+                    work.appendleft((target, end))
+                    end = target
+            frag = vid_frag.get(skey, 0)
+            items.append(
+                _make_item(len(items), source, "video", start, end, "fit", analysis, fragment=frag)
             )
+            vid_frag[skey] = frag + 1
+            last_source = skey
+            continue
+
+        # Image. If the slot is longer than the max hold, give this photo only the
+        # first piece and hand the rest back so the NEXT (different) photo fills it.
+        span = end - start
+        parts = 1
+        if max_image_duration and span > max_image_duration:
+            # Bound the piece count so each piece stays >= min_gap: a tiny
+            # max_image_duration can't explode the clip count or round a sub-clip
+            # down to zero duration.
+            parts = min(math.ceil(span / max_image_duration), max(1, int(span / min_gap)))
+        if parts >= 2:
+            piece_end = start + span / parts
+            items.append(
+                _make_item(
+                    len(items), source, "image", start, piece_end,
+                    effects[effect_index % len(effects)], analysis,
+                )
+            )
+            work.appendleft((piece_end, end))
+        else:
+            items.append(
+                _make_item(
+                    len(items), source, "image", start, end,
+                    effects[effect_index % len(effects)], analysis,
+                )
+            )
+        img_use[skey] = img_use.get(skey, 0) + 1
+        effect_index += 1
+        last_source = skey
+
+    if cap_exceeded:
+        print(
+            f"Not enough images to keep every photo under {cap} uses; some repeat "
+            "more often. Add more photos for more variety.",
+            file=sys.stderr,
         )
+
+    if max_items and len(items) > max_items:
+        # Truncate, then stretch the kept final clip back to the song end so the
+        # video still covers the full audio (otherwise -shortest would clip it).
+        items = items[:max_items]
+        items[-1].end = round(song_end, 4)
+        items[-1].duration = round(items[-1].end - items[-1].start, 4)
 
     return Timeline(
         audio=analysis.to_json(),
@@ -136,6 +260,46 @@ def build_timeline(
         fps=fps,
         items=items,
         focus=focus,
+    )
+
+
+def _downsample_segments(
+    segments: list[tuple[float, float]], target: int
+) -> list[tuple[float, float]]:
+    """Merge adjacent segments down to ``target`` of them, spread evenly.
+
+    Keeps the first (0.0) and last (song end) boundaries so coverage and continuity
+    are preserved; intermediate boundaries are sampled at even fractions.
+    """
+    if target >= len(segments) or target < 1:
+        return segments
+    boundaries = [segments[0][0]] + [seg[1] for seg in segments]
+    total = len(segments)
+    keep = sorted({round(i * total / target) for i in range(target + 1)})
+    points = [boundaries[i] for i in keep]
+    return list(zip(points, points[1:]))
+
+
+def _make_item(
+    index: int,
+    source: Path,
+    source_type: str,
+    start: float,
+    end: float,
+    effect: str,
+    analysis: AudioAnalysis,
+    fragment: int = 0,
+) -> TimelineItem:
+    return TimelineItem(
+        index=index,
+        source=str(source),
+        source_type=source_type,
+        start=round(start, 4),
+        end=round(end, 4),
+        duration=round(end - start, 4),
+        effect=effect,
+        transition_hint=_transition_hint_for(start, analysis.sections),
+        fragment=fragment,
     )
 
 
@@ -217,8 +381,7 @@ def _adaptive_cut_points(
     for point in points:
         if not deduped or point - deduped[-1] >= min_gap:
             deduped.append(point)
-    if deduped[-1] < duration:
-        deduped.append(duration)
+    _land_on_duration(deduped, duration, min_gap)
 
     return deduped
 
@@ -236,71 +399,20 @@ def _cut_points(beats: list[float], duration: float, beats_per_cut: int) -> list
     for point in points:
         if not deduped or point - deduped[-1] >= 0.35:
             deduped.append(point)
-    if deduped[-1] < duration:
-        deduped.append(duration)
+    _land_on_duration(deduped, duration, 0.35)
     return deduped
 
 
-def _enforce_min_duration(cut_points: list[float], min_duration: float) -> list[float]:
-    """Drop interior cut points so no clip is shorter than ``min_duration``.
+def _land_on_duration(deduped: list[float], duration: float, min_gap: float) -> None:
+    """Ensure the cut points end exactly at ``duration`` without a sub-floor sliver.
 
-    Greedily keeps a cut only when it is at least ``min_duration`` past the last kept
-    cut, which merges short clips into their neighbour. The first point (0.0) and the
-    final endpoint (the song's end) are always preserved; a too-short final clip is
-    merged backward into the previous one.
+    Appends ``duration`` only when it is at least ``min_gap`` past the last kept cut;
+    otherwise snaps the last cut to ``duration``. This avoids a final (last_beat,
+    duration) pair only microseconds apart, which would round to a zero-duration clip.
     """
-    if len(cut_points) <= 2:
-        return cut_points
-
-    result = [cut_points[0]]
-    for point in cut_points[1:-1]:
-        if point - result[-1] >= min_duration:
-            result.append(point)
-
-    last = cut_points[-1]
-    if last - result[-1] < min_duration and len(result) > 1:
-        result.pop()
-    result.append(last)
-    return result
-
-
-def _enforce_max_duration(
-    cut_points: list[float],
-    duration: float,
-    max_duration: float,
-    min_duration: float | None = None,
-) -> list[float]:
-    result = [cut_points[0]]
-    min_gap = 0.35
-
-    for i in range(len(cut_points) - 1):
-        current = cut_points[i]
-        next_point = cut_points[i + 1]
-        interval = next_point - current
-
-        if interval > max_duration:
-            num_splits = math.ceil(interval / max_duration)
-            if min_duration:
-                # Never split so finely that a piece would drop below the minimum;
-                # if min and max can't both hold, respect the minimum (fewer splits).
-                num_splits = min(num_splits, max(1, int(interval // min_duration)))
-            step = interval / num_splits
-            for j in range(1, num_splits):
-                split_point = current + step * j
-                if split_point - result[-1] >= min_gap:
-                    result.append(split_point)
-
-        if next_point - result[-1] >= min_gap:
-            result.append(next_point)
-
-    # Always land the final cut exactly on the song's end. Otherwise, if the last
-    # interval fell below min_gap it was dropped above, leaving result[-1] < duration:
-    # the rendered video would be shorter than the audio and "-shortest" would clip
-    # the song's ending mid-note.
-    if result[-1] < duration:
-        if duration - result[-1] < min_gap and len(result) > 1:
-            result[-1] = duration
-        else:
-            result.append(duration)
-
-    return result
+    if deduped[-1] >= duration:
+        return
+    if duration - deduped[-1] >= min_gap or len(deduped) == 1:
+        deduped.append(duration)
+    else:
+        deduped[-1] = duration
