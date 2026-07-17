@@ -20,6 +20,11 @@ _XFADE_AVAILABLE: bool | None = None
 
 _XFADE_DURATION = 0.25
 
+# How far the rendered silent video's duration may diverge from the timeline's
+# intended song-time schedule before we warn. A mismatch here means the video
+# and audio tracks will drift apart on playback (see _warn_if_duration_drifted).
+_DURATION_DRIFT_TOLERANCE = 0.15
+
 # Per-clip intermediates are encoded near-losslessly so the ONLY meaningful
 # compression is the final assembly encode (controlled by crf/preset). This avoids
 # the visible quality loss from compounding two lossy generations. These temp files
@@ -49,15 +54,17 @@ def render_timeline(
 
     with tempfile.TemporaryDirectory(dir=str(base_work_dir) if base_work_dir else None) as tmp:
         tmp_path = Path(tmp)
+        xfade_on = _xfade_enabled(timeline.items)
         clip_paths = []
-        for item in timeline.items:
+        for i, item in enumerate(timeline.items):
+            incoming_xfade = xfade_on and _uses_incoming_xfade(item, i, len(timeline.items))
             clip_path = tmp_path / f"clip_{item.index:04d}.mp4"
-            _render_clip(item, timeline, clip_path)
+            _render_clip(item, timeline, clip_path, incoming_xfade)
             clip_paths.append(clip_path)
 
         silent_video = tmp_path / "silent.mp4"
         xfade_result = None
-        if _check_xfade_support():
+        if xfade_on:
             xfade_result = _build_xfade_filtergraph(clip_paths, timeline.items, timeline.fps)
 
         if xfade_result is not None:
@@ -111,6 +118,8 @@ def render_timeline(
                 ],
                 check=True,
             )
+
+        _warn_if_duration_drifted(silent_video, timeline)
 
         audio_path = timeline.audio["audio_path"]
         _mux_audio(
@@ -244,6 +253,26 @@ def _probe_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def _warn_if_duration_drifted(silent_video: Path, timeline: Timeline) -> None:
+    """Warn if the rendered video's length diverges from the intended schedule.
+
+    Every TimelineItem.duration is a slice of song-time, and their sum is the
+    length the video is supposed to end up. If a rendering bug shrinks or
+    stretches the actual output relative to that sum, audio and video will
+    drift apart on playback with no other visible symptom — so surface it here.
+    """
+    expected = sum(item.duration for item in timeline.items)
+    actual = _probe_duration(silent_video)
+    drift = actual - expected
+    if abs(drift) > _DURATION_DRIFT_TOLERANCE:
+        print(
+            f"Warning: rendered video duration ({actual:.2f}s) diverges from the "
+            f"song-time schedule ({expected:.2f}s) by {drift:+.2f}s. Audio and "
+            "video may be out of sync.",
+            file=sys.stderr,
+        )
+
+
 def _build_video_audio_bed(
     auds: list[tuple[TimelineItem, Path]],
     total: float,
@@ -325,24 +354,35 @@ def _check_xfade_support() -> bool:
     return _XFADE_AVAILABLE
 
 
+def _uses_incoming_xfade(item: TimelineItem, index: int, total_items: int) -> bool:
+    """True if ``item`` (at position ``index``) is the incoming ("clip B") side
+    of an xfade transition: it has a predecessor, isn't the last clip (xfade is
+    skipped there to avoid audio cutoff), and is long enough to blend."""
+    return (
+        index > 0
+        and getattr(item, "transition_hint", "cut") == "xfade"
+        and item.duration >= _XFADE_DURATION * 2
+        and index < total_items - 1
+    )
+
+
+def _xfade_enabled(items: list[TimelineItem]) -> bool:
+    """Whether xfade transitions will be used at all for this render."""
+    # Skip xfade for large clip counts; ffmpeg's filter graph becomes unstable
+    # with 50+ inputs and complex nested filters. Fallback to plain concat.
+    return 2 <= len(items) <= 50 and _check_xfade_support()
+
+
 def _build_xfade_filtergraph(
     clip_paths: list[Path],
     items: list[TimelineItem],
     fps: int,
 ) -> tuple[str, str] | None:
-    if len(items) < 2:
-        return None
-
-    # Skip xfade for large clip counts; ffmpeg's filter graph becomes unstable
-    # with 50+ inputs and complex nested filters. Fallback to plain concat.
-    if len(items) > 50:
+    if not _xfade_enabled(items):
         return None
 
     needs_xfade = any(
-        i > 0
-        and getattr(item, "transition_hint", "cut") == "xfade"
-        and item.duration >= _XFADE_DURATION * 2
-        for i, item in enumerate(items)
+        _uses_incoming_xfade(item, i, len(items)) for i, item in enumerate(items)
     )
     if not needs_xfade:
         return None
@@ -369,14 +409,8 @@ def _build_xfade_filtergraph(
 
     for i in range(1, len(items)):
         item = items[i]
-        hint = getattr(item, "transition_hint", "cut")
         next_label = f"v{i:04d}"
-        use_xfade = (
-            hint == "xfade"
-            and item.duration >= _XFADE_DURATION * 2
-            # avoid xfade on the very last clip to prevent audio cutoff
-            and i < len(items) - 1
-        )
+        use_xfade = _uses_incoming_xfade(item, i, len(items))
 
         if use_xfade:
             offset = max(0.0, cumulative - _XFADE_DURATION)
@@ -385,7 +419,11 @@ def _build_xfade_filtergraph(
                 f"xfade=transition=fade:duration={_XFADE_DURATION}:offset={offset:.4f}"
                 f",settb=1/{fps}[{next_label}]"
             )
-            cumulative += item.duration - _XFADE_DURATION
+            # The clip for `item` was rendered _XFADE_DURATION longer than its
+            # scheduled duration (see _render_clip/incoming_xfade), so the
+            # overlap this xfade consumes comes out of that padding rather than
+            # out of the schedule — cumulative stays the true song-time sum.
+            cumulative += item.duration
         else:
             # Re-stamp the timebase after concat: the concat filter resets its output
             # timebase, which would otherwise mismatch the next xfade input.
@@ -399,16 +437,30 @@ def _build_xfade_filtergraph(
     return ";".join(filters), prev_label
 
 
-def _render_clip(item: TimelineItem, timeline: Timeline, output_path: Path) -> None:
+def _render_clip(
+    item: TimelineItem, timeline: Timeline, output_path: Path, incoming_xfade: bool = False
+) -> None:
     source = Path(item.source)
     if item.source_type == "image":
-        _render_image_clip(source, item, timeline, output_path)
+        _render_image_clip(source, item, timeline, output_path, incoming_xfade)
     else:
-        _render_video_clip(source, item, timeline, output_path)
+        _render_video_clip(source, item, timeline, output_path, incoming_xfade)
 
 
-def _render_image_clip(source: Path, item: TimelineItem, timeline: Timeline, output_path: Path) -> None:
-    frames = max(1, int(round(item.duration * timeline.fps)))
+def _render_image_clip(
+    source: Path,
+    item: TimelineItem,
+    timeline: Timeline,
+    output_path: Path,
+    incoming_xfade: bool = False,
+) -> None:
+    # When this item is about to be blended into by an xfade, render it
+    # _XFADE_DURATION longer than its scheduled duration so the transition's
+    # overlap eats into that padding rather than shrinking the song-time
+    # schedule (see _build_xfade_filtergraph). Purely formulaic for images —
+    # the zoompan animation just runs a bit longer, no visual discontinuity.
+    render_duration = item.duration + (_XFADE_DURATION if incoming_xfade else 0.0)
+    frames = max(1, int(round(render_duration * timeline.fps)))
     scale = f"scale={timeline.width}:{timeline.height}:force_original_aspect_ratio=increase"
     crop = _crop_filter(source, timeline)
     zoom = _zoompan_filter(item.effect, frames, timeline)
@@ -422,7 +474,7 @@ def _render_image_clip(source: Path, item: TimelineItem, timeline: Timeline, out
             "-i",
             str(source),
             "-t",
-            f"{item.duration:.4f}",
+            f"{render_duration:.4f}",
             "-vf",
             vf,
             "-r",
@@ -440,23 +492,35 @@ def _render_image_clip(source: Path, item: TimelineItem, timeline: Timeline, out
     )
 
 
-def _render_video_clip(source: Path, item: TimelineItem, timeline: Timeline, output_path: Path) -> None:
+def _render_video_clip(
+    source: Path,
+    item: TimelineItem,
+    timeline: Timeline,
+    output_path: Path,
+    incoming_xfade: bool = False,
+) -> None:
     vf = (
         f"scale={timeline.width}:{timeline.height}:force_original_aspect_ratio=increase,"
         f"crop={timeline.width}:{timeline.height},fps={timeline.fps},format=yuv420p"
     )
+    # See _render_image_clip: pad an xfade-incoming clip by _XFADE_DURATION so
+    # the transition consumes padding, not the schedule. For real footage,
+    # source that padding as lead-in BEFORE the nominal start (extra_head)
+    # so the transition blends contiguous, seamless content.
+    extra_head = _XFADE_DURATION if incoming_xfade else 0.0
+    render_duration = item.duration + extra_head
     # When a video is reused, each appearance seeks to a different fragment so it
     # never shows the same moment twice. Input seeking (-ss before -i) combined with
     # -stream_loop -1 plays `duration` seconds from the offset, looping if it reaches
     # the source end.
-    offset = _fragment_offset(source, item)
+    offset = _fragment_offset(source, item, extra_head)
     cmd = ["ffmpeg", "-y"]
     if offset > 0:
         cmd += ["-ss", f"{offset:.4f}"]
     cmd += [
         "-stream_loop", "-1",
         "-i", str(source),
-        "-t", f"{item.duration:.4f}",
+        "-t", f"{render_duration:.4f}",
         "-vf", vf,
         "-an",
         "-c:v", "libx264",
@@ -467,7 +531,7 @@ def _render_video_clip(source: Path, item: TimelineItem, timeline: Timeline, out
     subprocess.run(cmd, check=True)
 
 
-def _fragment_offset(source: Path, item: TimelineItem) -> float:
+def _fragment_offset(source: Path, item: TimelineItem, extra_head: float = 0.0) -> float:
     """Start offset (seconds) into the source for this video appearance.
 
     The source holds at most ``capacity = floor(source_duration / clip)`` non-
@@ -476,6 +540,11 @@ def _fragment_offset(source: Path, item: TimelineItem) -> float:
     appearances seek to distinct, evenly-spaced moments (instead of the arbitrary
     modular collisions a raw ``fragment * clip % source`` produces). Beyond that the
     source simply has no more distinct footage, so fragments reuse evenly.
+
+    ``extra_head`` (seconds) shifts the seek point earlier so an xfade-padded
+    clip's extra runtime comes from real contiguous footage preceding the
+    nominal start rather than a discontinuous jump; clamped to 0 when the
+    fragment starts too close to the source's beginning.
 
     Returns 0 for the first appearance or when the source is no longer than the clip
     (it just loops).
@@ -487,7 +556,8 @@ def _fragment_offset(source: Path, item: TimelineItem) -> float:
     if source_duration <= item.duration:
         return 0.0
     capacity = max(1, int(source_duration / item.duration))
-    return round((fragment % capacity) * (source_duration / capacity), 4)
+    base = (fragment % capacity) * (source_duration / capacity)
+    return round(max(0.0, base - extra_head), 4)
 
 
 def _crop_filter(source: Path, timeline: Timeline) -> str:
