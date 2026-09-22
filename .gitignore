@@ -16,3 +16,8 @@ assets.json
 
 # Secrets
 .env
+
+# Local tooling and caches (not part of the project)
+.pytest_cache/
+.claude/
+output/
